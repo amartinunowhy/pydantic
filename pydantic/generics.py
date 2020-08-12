@@ -1,4 +1,18 @@
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Tuple, Type, TypeVar, Union, cast, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Dict,
+    Iterable,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 from .class_validators import gather_all_validators
 from .fields import FieldInfo, ModelField
@@ -57,12 +71,11 @@ class GenericModel(BaseModel):
             ),
         )
         created_model.Config = cls.Config
-        concrete = all(not _is_typevar(v) for v in concrete_type_hints.values())
+        sub_types = concrete_type_hints.values()
+        concrete = all(_is_resolved(v) for v in sub_types)
         created_model.__concrete__ = concrete
         if not concrete:
-            parameters = tuple(v for v in concrete_type_hints.values() if _is_typevar(v))
-            parameters = tuple({k: None for k in parameters}.keys())  # get unique params while maintaining order
-            created_model.__parameters__ = parameters
+            created_model.__parameters__ = _unconcrete_types(sub_types)
         _generic_types_cache[(cls, params)] = created_model
         if len(params) == 1:
             _generic_types_cache[(cls, params[0])] = created_model
@@ -105,12 +118,43 @@ def _build_generic_fields(
     }
 
 
+AGGREGATE_GENERIC_TYPES = [Union, list, Tuple]
+
+
 def _parameterize_generic_field(field_type: Type[Any], typevars_map: Dict[TypeVarType, Type[Any]]) -> Type[Any]:
     if lenient_issubclass(field_type, GenericModel) and not field_type.__concrete__:
         parameters = tuple(typevars_map.get(param, param) for param in field_type.__parameters__)
         field_type = field_type[parameters]
+    elif get_origin(field_type) in AGGREGATE_GENERIC_TYPES:
+        specialized_params = tuple(_parameterize_generic_field(p, typevars_map) for p in get_args(field_type))
+        field_type = field_type.copy_with(specialized_params)
     return field_type
+
+
+def _is_resolved(v: Any) -> bool:
+    if get_origin(v) in AGGREGATE_GENERIC_TYPES:
+        result = all(_is_resolved(s) for s in get_args(v))
+        return result
+
+    return (not _is_typevar(v)) and _is_concrete(v)
 
 
 def _is_typevar(v: Any) -> bool:
     return isinstance(v, TypeVar)  # type: ignore
+
+
+def _is_concrete(v: Any) -> bool:
+    return not lenient_issubclass(v, GenericModel) or v.__concrete__
+
+
+def _unconcrete_types(sub_types: Iterable[Type[Any]]) -> Tuple[Type[Any], ...]:
+    parameters = []
+    for v in sub_types:
+        if _is_typevar(v):
+            parameters.append(v)
+        elif not _is_concrete(v):
+            parameters += v.__parameters__
+        elif get_origin(v) in [Union, list, Tuple]:
+            parameters += _unconcrete_types(get_args(v))
+
+    return tuple({k: None for k in parameters}.keys())  # get unique params while maintaining order
